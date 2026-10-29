@@ -48,6 +48,8 @@ make -j2
 QT_QPA_PLATFORM=offscreen ./tst_mainwindow
 ```
 
+The [GitHub Actions workflow](.github/workflows/ci.yml) builds the application and runs these tests on Ubuntu with Qt 5 for pushes and pull requests.
+
 The tests use a temporary fake `scp` executable and local fixtures. They cover missing files, selected-file comparisons, paths containing spaces, failed transfers, uploading the replacement copy, and rejecting invalid remote names. They do not contact a remote host. The fake executable requires a POSIX shell.
 
 ## Prototype limitations
