@@ -1,21 +1,32 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
-#include <QByteArray>
-#include <QFile>
-#include <QDebug>
-#include <QXmlStreamReader>
-#include <QProcess>
 
+#include <QDir>
+#include <QFile>
+#include <QProcess>
+#include <QRegularExpression>
+#include <QXmlStreamReader>
+
+namespace {
+const QString remoteDirectory = QStringLiteral("root@192.168.1.1:/root/");
+}
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
+    , consoleBoard(new QPlainTextEdit(this))
+    , consoleSppz(new QPlainTextEdit(this))
+    , tempFolder(QDir::homePath() + "/ssh-xml-manager/downloads")
+    , SppzFolder(QDir::homePath() + "/ssh-xml-manager/files")
 {
     ui->setupUi(this);
-
     ui->scrollArea_Board->setWidget(consoleBoard);
     ui->scrollArea_Sppz->setWidget(consoleSppz);
-
+    consoleBoard->setReadOnly(true);
+    consoleSppz->setReadOnly(true);
+    ui->boardPath->setPlainText(tempFolder);
+    ui->sppzPath->setPlainText(SppzFolder);
+    ui->fileName->setPlainText("pi.xml");
 }
 
 MainWindow::~MainWindow()
@@ -23,99 +34,140 @@ MainWindow::~MainWindow()
     delete ui;
 }
 
-
-void MainWindow::getFile(QString fileName){
-    QProcess process;
-    QString command = "scp root@192.168.1.1:/root/"+fileName+" "+tempFolder;
-    //QString command = "sshpass -p 'root' scp root@192.168.1.1:/root/sshtest.xml /our/home/folder";
-    process.start(command);
-    consoleBoard->appendPlainText(command);
-
-    if (!process.waitForFinished()) {
-
-        consoleBoard->appendPlainText("Failed to execute SCP command.");
-        qWarning("Failed to execute SCP command.");
+QString MainWindow::selectedFileName()
+{
+    const QString name = ui->fileName->toPlainText().trimmed();
+    // A single remote file name, without shell metacharacters or path traversal.
+    static const QRegularExpression validName("^[A-Za-z0-9_][A-Za-z0-9_.-]*$");
+    if (!validName.match(name).hasMatch()) {
+        consoleBoard->appendPlainText("Enter a file name using letters, digits, _, - or . (no path).");
+        showResult("Invalid file name", false);
+        return QString();
     }
-    QByteArray output = process.readAllStandardOutput();
-    QByteArray outputError = process.readAllStandardError();
-
-    consoleBoard->appendPlainText(output);
-    consoleBoard->appendPlainText(outputError);
+    return name;
 }
 
-void MainWindow::changeFile(QString fileName){
+bool MainWindow::runScp(const QStringList &arguments)
+{
     QProcess process;
-
-    QString command = "scp "+tempFolder+"/"+fileName+" root@192.168.1.1:/root";//server ip and password
-    //QString command = "sshpass -p 'root' scp root@192.168.1.1:/root/sshtest.xml /our/home/folder";
-    process.start(command);
-    qDebug()<<command;
-
-    if (!process.waitForFinished()) {
-        consoleBoard->clear();
-        consoleBoard->appendPlainText("Failed to execute SCP command.");
-        qWarning("Failed to execute SCP command.");
+    // Keep arguments separate so local paths containing spaces stay intact.
+    process.start("scp", QStringList{"-B", "-o", "ConnectTimeout=10", "--"} + arguments);
+    if (!process.waitForStarted()) {
+        consoleBoard->appendPlainText("Could not start scp: " + process.errorString());
+        return false;
     }
-    QByteArray output = process.readAllStandardOutput();
-    QByteArray outputError = process.readAllStandardError();
-    consoleBoard->clear();
-    consoleBoard->appendPlainText(output);
-    consoleBoard->appendPlainText(outputError);
-
+    if (!process.waitForFinished(30000)) {
+        process.kill();
+        process.waitForFinished();
+        consoleBoard->appendPlainText("SCP timed out or failed to finish.");
+        consoleBoard->appendPlainText(QString::fromLocal8Bit(process.readAllStandardError()));
+        return false;
+    }
+    consoleBoard->appendPlainText(QString::fromLocal8Bit(process.readAllStandardOutput()));
+    consoleBoard->appendPlainText(QString::fromLocal8Bit(process.readAllStandardError()));
+    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+        consoleBoard->appendPlainText("SCP failed (exit code " + QString::number(process.exitCode()) + ").");
+        return false;
+    }
+    return true;
 }
 
+bool MainWindow::getFile(const QString &fileName)
+{
+    if (fileName.isEmpty())
+        return false;
+    if (tempFolder.isEmpty() || !QDir().mkpath(tempFolder)) {
+        consoleBoard->appendPlainText("Cannot create the download folder.");
+        return false;
+    }
+    return runScp({remoteDirectory + fileName, QDir(tempFolder).absolutePath() + "/"});
+}
+
+bool MainWindow::changeFile(const QString &fileName)
+{
+    if (fileName.isEmpty())
+        return false;
+    const QString source = QDir(SppzFolder).absoluteFilePath(fileName);
+    QByteArray data;
+    if (!readFile(source, data, consoleSppz))
+        return false;
+    return runScp({source, remoteDirectory + fileName});
+}
+
+void MainWindow::showResult(const QString &message, bool success)
+{
+    ui->compareLabel->setText(message);
+    ui->compareLabel->setStyleSheet(success
+        ? "background-color:green; font-size:14px; font:bold; color:black"
+        : "background-color:red; font-size:14px; font:bold; color:white");
+}
 
 void MainWindow::on_giveFiles_clicked()
 {
-
-    changeFile("sshtest.txt");
-    ui->compareLabel->setText("Files update");
-    ui->compareLabel->setStyleSheet("background-color:green; font-size:14px; font:bold; color:black");
+    const bool success = changeFile(selectedFileName());
+    showResult(success ? "File updated" : "Update failed", success);
 }
 
+bool MainWindow::readFile(const QString &path, QByteArray &data, QPlainTextEdit *console)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        console->appendPlainText("Cannot read " + path + ": " + file.errorString());
+        return false;
+    }
+    data = file.readAll();
+    if (file.error() != QFile::NoError) {
+        console->appendPlainText("Cannot read " + path + ": " + file.errorString());
+        return false;
+    }
+    return true;
+}
 
-void MainWindow::readPi(QByteArray fileData, QPlainTextEdit *console)
+void MainWindow::readPi(const QByteArray &fileData, QPlainTextEdit *console)
 {
     console->clear();
     QXmlStreamReader xml(fileData);
-    while (!xml.atEnd())
-    {
+    while (!xml.atEnd()) {
         xml.readNext();
-        QString stringAttributes;
-        if(xml.attributes().hasAttribute("ClassTag"))
-            stringAttributes.append(" Тег класса - "+xml.attributes().value("ClassTag").toString()+"; ");
-        if(xml.attributes().hasAttribute("id"))
-            stringAttributes.append(" Идентификатор - "+xml.attributes().value("id").toString()+"; ");
-        if(xml.attributes().hasAttribute("filename"))
-            stringAttributes.append(" Имя файла - "+xml.attributes().value("filename").toString()+"; ");
-        if(xml.attributes().hasAttribute("RUS"))
-            stringAttributes.append(" "+xml.attributes().value("RUS").toString()+": ");
-        if(xml.attributes().hasAttribute("CharGroupId"))
-            stringAttributes.append(" Идентификатор - "+xml.attributes().value("CharGroupId").toString()+"; ");
-        if(xml.attributes().hasAttribute("Value"))
-            stringAttributes.append(" "+xml.attributes().value("Value").toString()+"; ");
-        if(stringAttributes.size()>0)
-            //qDebug()<<"stringAttributes"<< stringAttributes;
-            console->appendPlainText(stringAttributes);
+        if (!xml.isStartElement())
+            continue;
+        QString attributes;
+        const auto values = xml.attributes();
+        for (const QString &name : QStringList{"ClassTag", "id", "filename", "RUS", "CharGroupId", "Value"}) {
+            if (values.hasAttribute(name))
+                attributes += name + " = " + values.value(name).toString() + "; ";
+        }
+        if (!attributes.isEmpty())
+            console->appendPlainText(attributes);
     }
-
-
+    if (xml.hasError())
+        console->appendPlainText("Invalid XML at line " + QString::number(xml.lineNumber()) + ": " + xml.errorString());
 }
 
-void MainWindow::readTempPi(){
-    getFile("pi.xml");
-    QFile file(tempFolder+"/sshtest.xml");
-    file.open(QIODevice::ReadOnly);
-    QByteArray array = file.readAll();
-    file.close();
-    readPi(array,consoleBoard);
+void MainWindow::readTempPi()
+{
+    const QString name = selectedFileName();
+    if (!getFile(name)) {
+        showResult("Download failed", false);
+        return;
+    }
+    QByteArray data;
+    if (readFile(QDir(tempFolder).filePath(name), data, consoleBoard))
+        readPi(data, consoleBoard);
+    else
+        showResult("Cannot read download", false);
 }
-void MainWindow::readSppzPi(){
-    QFile file(SppzFolder+"/sshtest.xml");
-    file.open(QIODevice::ReadOnly);
-    QByteArray array = file.readAll();
-    file.close();
-    readPi(array,consoleSppz);
+
+void MainWindow::readSppzPi()
+{
+    const QString name = selectedFileName();
+    if (name.isEmpty())
+        return;
+    QByteArray data;
+    if (readFile(QDir(SppzFolder).filePath(name), data, consoleSppz))
+        readPi(data, consoleSppz);
+    else
+        showResult("Cannot read local file", false);
 }
 
 void MainWindow::on_readTempPi_clicked()
@@ -127,46 +179,42 @@ void MainWindow::on_readSppzPi_clicked()
 {
     readSppzPi();
 }
+
 void MainWindow::on_compareButton_clicked()
 {
-    QFile fileTemp(tempFolder+"/sshtest.xml");
-    fileTemp.open(QIODevice::ReadOnly);
-    QByteArray arrayTemp = fileTemp.readAll();
-    fileTemp.close();
-
-    QFile fileSppz(SppzFolder+"/sshtest.xml");
-    fileSppz.open(QIODevice::ReadOnly);
-    QByteArray arraySppz = fileSppz.readAll();
-    fileSppz.close();
-
-    if(arrayTemp==arraySppz){
-        ui->compareLabel->setText("Files equals");
-        ui->compareLabel->setStyleSheet("background-color:green; font-size:14px; font:bold; color:black");
-        }
-    else{
-        ui->compareLabel->setText("Files differs");
-        ui->compareLabel->setStyleSheet("background-color:red; font-size:14px; font:bold; color:white");
+    const QString name = selectedFileName();
+    if (name.isEmpty())
+        return;
+    QByteArray downloaded, local;
+    if (!readFile(QDir(tempFolder).filePath(name), downloaded, consoleBoard)
+        || !readFile(QDir(SppzFolder).filePath(name), local, consoleSppz)) {
+        showResult("Cannot compare files", false);
+        return;
     }
+    const bool equal = downloaded == local;
+    showResult(equal ? "Files are equal" : "Files differ", equal);
 }
-
 
 void MainWindow::on_changeBoardPathButton_clicked()
 {
-
-    tempFolder=ui->boardPath->toPlainText();
-
+    const QString path = ui->boardPath->toPlainText().trimmed();
+    if (!path.isEmpty())
+        tempFolder = QDir(path).absolutePath();
+    else
+        showResult("Enter a download folder", false);
 }
-
 
 void MainWindow::on_changeSPPZPathButton_clicked()
 {
-    SppzFolder=ui->sppzPath->toPlainText();
+    const QString path = ui->sppzPath->toPlainText().trimmed();
+    if (!path.isEmpty())
+        SppzFolder = QDir(path).absolutePath();
+    else
+        showResult("Enter a local folder", false);
 }
-
 
 void MainWindow::on_getFileButton_clicked()
 {
-    getFile(ui->fileName->toPlainText());
-
+    const bool success = getFile(selectedFileName());
+    showResult(success ? "File downloaded" : "Download failed", success);
 }
-
